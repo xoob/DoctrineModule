@@ -22,7 +22,9 @@ namespace DoctrineModule\Stdlib\Hydrator;
 use DateTime;
 use Traversable;
 use Doctrine\Common\Persistence\ObjectManager;
+use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Persistence\Mapping\ClassMetadata;
+use Zend\Stdlib\ArrayUtils;
 use Zend\Stdlib\Hydrator\HydratorInterface;
 use Zend\Stdlib\Hydrator\ClassMethods as ClassMethodsHydrator;
 
@@ -95,7 +97,66 @@ class DoctrineObject implements HydratorInterface
      */
     public function extract($object)
     {
-        return $this->hydrator->extract($object);
+        $metadata = $this->objectManager->getClassMetadata(get_class($object));
+        $data     = $this->hydrator->extract($object);
+
+        foreach($data as $field => &$value) {
+            if (!$metadata->hasField($field) && !$metadata->hasAssociation($field)) {
+                unset($data[$field]);
+                continue;
+            }
+
+            if ($value === null) {
+                continue;
+            }
+
+            // @todo DateTime (and other types) conversion should be handled by doctrine itself in future
+            if (in_array($metadata->getTypeOfField($field), array('datetime', 'time', 'date'))) {
+                if ($value instanceof DateTime) {
+                    $value = $value->format(DateTime::ISO8601);
+                }
+            }
+
+            if ($metadata->hasAssociation($field)) {
+                $target    = $metadata->getAssociationTargetClass($field);
+                $refColumn = null;
+
+                if ($metadata->isAssociationInverseSide($field)) {
+                    $targetMetadata = $this->objectManager->getClassMetadata($target);
+
+                    if (!$targetMetadata->isIdentifierComposite) {
+                        $refColumn = $targetMetadata->getSingleIdentifierFieldName($field);
+                    }
+                } elseif ($metadata->isAssociationWithSingleJoinColumn($field)) {
+                    $refColumn = $metadata->getSingleAssociationReferencedJoinColumnName($field);
+                }
+
+                if ($refColumn) {
+                    if ($metadata->isSingleValuedAssociation($field)) {
+                        $value = $this->fromOne($value, $target, $refColumn);
+
+                        if ($value === false) {
+                            unset($data[$field]);
+                        }
+                    } elseif ($metadata->isCollectionValuedAssociation($field)) {
+                        $value = $this->fromMany($value, $target, $refColumn);
+                    }
+                }
+            }
+        }
+
+        /*
+        foreach ($data as $field => $fieldValue) {
+            $column = $metadata->getColumnName($field);
+
+            if ($field != $column) {
+                $data[$column] = $fieldValue;
+                unset($data[$field]);
+            }
+        }
+        */
+
+        return $data;
     }
 
     /**
@@ -118,9 +179,7 @@ class DoctrineObject implements HydratorInterface
             // @todo DateTime (and other types) conversion should be handled by doctrine itself in future
             if (in_array($this->metadata->getTypeOfField($field), array('datetime', 'time', 'date'))) {
                 if (is_int($value)) {
-                    $dt = new DateTime();
-                    $dt->setTimestamp($value);
-                    $value = $dt;
+                    $value = new DateTime("@{$value}");
                 } elseif (is_string($value)) {
                     $value = new DateTime($value);
                 }
@@ -157,21 +216,71 @@ class DoctrineObject implements HydratorInterface
     /**
      * @param mixed $valueOrObject
      * @param string $target
-     * @return array
+     * @return ArrayCollection
      */
     protected function toMany($valueOrObject, $target)
     {
         if (!is_array($valueOrObject) && !$valueOrObject instanceof Traversable) {
-            $valueOrObject = (array) $valueOrObject;
+            $valueOrObject = array($valueOrObject);
         }
 
-        $values = array();
+        $collection = new ArrayCollection();
 
         foreach($valueOrObject as $value) {
             if ($value instanceof $target) {
-                $values[] = $value;
+                $collection->add($value);
             } else {
-                $values[] = $this->find($target, $value);
+                $collection->add($this->find($target, $value));
+            }
+        }
+
+        return $collection;
+    }
+
+    /**
+     * @param  mixed  $valueOrObject
+     * @param  string $target
+     * @param  string $joinColumn
+     * @return string
+     */
+    protected function fromOne($value, $target, $refColumn)
+    {
+        if ($value instanceof $target) {
+            $refData = $this->hydrator->extract($value);
+
+            if (!isset($refData[$refColumn])) {
+                throw new \RuntimeException(sprintf(
+                    'Could not extract referenced join column %s#%s',
+                    $target,
+                    $refColumn
+                ));
+            }
+
+            $value = $refData[$refColumn];
+        }
+
+        return $value;
+    }
+
+    /**
+     * @param  mixed  $valueOrObject
+     * @param  string $target
+     * @param  string $joinColumn
+     * @return array
+     */
+    protected function fromMany($values, $target, $refColumn)
+    {
+        if (!is_array($values) && !$values instanceof Traversable) {
+            $values = (array) $values;
+        } elseif ($values instanceof Traversable) {
+            $values = ArrayUtils::iteratorToArray($values);
+        }
+
+        foreach($values as $key => &$value) {
+            $value = $this->fromOne($value, $target, $refColumn);
+
+            if ($value === false) {
+                unset($values[$key]);
             }
         }
 
